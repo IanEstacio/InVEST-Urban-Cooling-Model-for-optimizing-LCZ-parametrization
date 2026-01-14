@@ -1,0 +1,264 @@
+  /***
+* Name: Calibration of the InVEST Urban Cooling Model
+* Author: Ian Estacio, 
+* Description: 
+* Tags: UHI, Urban Cooling, Green spaces
+***/
+
+model CalibratingUCM
+
+global{
+	//--Runtime parameters--		
+	float startt <- machine_time;
+	bool stop_currentrun <- false;
+	bool is_batch <- false;
+	string suffix <- 'BuenosAirespartF';
+	
+	//--Simulation parameters--	
+	float cellwidthheight <- 100.00 #m;
+	float RefAirTemp <- 23.0397;
+	float UHIEffect <- 0.911;
+	
+	//Calibration parameters
+	float AirBlendDist <- 450.0 #m;
+	float MaxCoolDist <- 600.0 #m;
+	float shade_weight <- 0.6;
+	float albedo_weight <- 0.2;
+	float evapotranspiration_weight <- 0.2;
+	
+	//--import of files and setting of the environment--
+	//raster files
+	file land_use_land_cover <- grid_file("../includes/BuenosAries/BuenosAries_LULC_final.tif");
+	file evapotranspiration <- grid_file("../includes/BuenosAries/BuenosAries_ET_final.tif");
+	file biophysical_table <- csv_file("../includes/Biophysical table/biophysical_table_night.csv",",");
+	file actual_air_temperature <- grid_file("../includes/BuenosAries/BuenosAries_maxTemp_final.tif");
+
+	//boundary
+	geometry shape <- envelope(land_use_land_cover);
+	
+	//--assessment parameters--
+	float model_standardeviation;
+	
+	//--initialization setting--
+	init {
+		gama.pref_parallel_simulations_all <- true;
+		evapotranspiration_weight <- 1.0 - shade_weight - albedo_weight;
+		matrix biophysical_matrix <- matrix(biophysical_table);
+		write "Initializing grid"+ (machine_time - startt)/1000;
+		ask cell {
+			grid_value <- -9999.0;
+			withdata <- false;
+			lucode <- int(bands[0]);
+			if (lucode >= 1 and lucode <= 17)and (bands[1] >= 0.0 and bands[1] < 40.0){
+				withdata <- true;
+			}
+			withactualTairmax <- false;
+			if (bands[2] >= -385 and bands[2] < 70.0){
+				withactualTairmax <- true;
+				Tairactual <- bands[2];
+			}
+			if withdata{
+				area <- (cellwidthheight^2)/10000.0;
+				ET0 <- float(bands[1]);
+				bool biophysicalparametersassigned <- false;
+				int rownumber <- 0;
+				loop while: !biophysicalparametersassigned{
+					if lucode = int((biophysical_matrix row_at rownumber)[2]){
+						shade <- float((biophysical_matrix row_at rownumber)[3]);
+						Kc <- float((biophysical_matrix row_at rownumber)[4]);
+						albedo <- float((biophysical_matrix row_at rownumber)[5]);
+						green_area <- int((biophysical_matrix row_at rownumber)[6]);
+						buildingintensity <- float((biophysical_matrix row_at rownumber)[7]);
+						biophysicalparametersassigned <- true;
+					}
+					rownumber <- rownumber+1;
+				}
+			}
+			create cellcenter number: 1{
+				location <- myself.location;
+				my_cell <- cell(location);
+				cell_area <- (cellwidthheight^2)/10000.0;
+				if myself.withdata{
+					cell_withdata <- true;
+				}
+				if myself.green_area = 1{
+					cell_green_area <- true;
+				}
+			}
+		}//
+		float ETmax <- cell max_of each.ET0;
+		write "Generating CC: " + (machine_time - startt)/1000;
+		ask cell where each.withdata{		
+			float ETI <- (Kc*ET0)/ETmax;
+			float CCday <- (shade_weight*shade)+(albedo_weight*albedo)+(evapotranspiration_weight*ETI);
+			float CCnight <- (1-buildingintensity);
+			CC <- CCday;
+		}
+		//save cell to:"../results/ET0_"+suffix+".tif" format:"geotiff";
+		ask cellcenter where each.cell_withdata{
+			cell_CC <- my_cell.CC;
+		}
+		write "Generating HM: " + (machine_time - startt)/1000;
+		float MaxCoolDist_rnd <- float(int(MaxCoolDist/cellwidthheight))*cellwidthheight;
+		point center <- centroid(world);
+		cellcenter closesttocenter <- cellcenter closest_to center;
+		list closesttocentersaround <- neighbors_at(closesttocenter, MaxCoolDist_rnd) of_species cellcenter;
+		int total_centers <- length(closesttocentersaround);
+		
+		ask cellcenter where each.cell_withdata{
+			list cellcenterssaround <- neighbors_at(self, MaxCoolDist_rnd) of_species cellcenter where each.cell_withdata;
+			float GA <- 0.0;
+			if cell_green_area{
+				GA <- GA + cell_area;
+			}
+			int total_centerswdata <- length(cellcenterssaround);
+			ask cellcenterssaround{
+				if self.cell_green_area{
+					GA <- GA + self.cell_area;
+				}
+			}
+			GA <- GA*float(total_centers+1)/float(total_centerswdata+1);
+			my_cell.GA <- GA;
+			list cellcenterssaround_t5 <- neighbors_at(self, MaxCoolDist_rnd*5) of_species cellcenter where each.cell_withdata;
+			float CCpark <- 0.0;
+			if cell_green_area{
+				CCpark <- CCpark + 1.0;
+			}
+			float kernelsum_withdata <-0.0;
+			ask cellcenterssaround_t5{
+				if self.cell_green_area{
+					CCpark <- CCpark + exp(-1.0*distance_to(myself,self)/(MaxCoolDist_rnd));
+				}
+				kernelsum_withdata <- kernelsum_withdata + exp(-1.0*distance_to(myself,self)/(MaxCoolDist_rnd));
+			}
+			CCpark <- CCpark/(kernelsum_withdata+1.0);
+			my_cell.CCpark <- CCpark;
+			float HM <- (cell_CC >= CCpark) or (GA < 2) ? cell_CC : CCpark;
+			cell_HM <- HM;
+			my_cell.HM <- HM;
+		}
+		write "Generating air temperature: " + (machine_time - startt)/1000;
+		ask cell where each.withdata{		
+			Tairnomix <- RefAirTemp + ((1-HM)*UHIEffect);
+			grid_value <- Tairnomix;
+		}
+		ask cellcenter where each.cell_withdata{
+			cell_Tairnomix <- my_cell.Tairnomix;
+		}
+		float AirBlendDist_rnd <- float(int(AirBlendDist/cellwidthheight))*cellwidthheight;
+		ask cellcenter where each.cell_withdata{
+			list cellcenterssaround_airmixt5 <- neighbors_at(self, (AirBlendDist_rnd*5)) of_species cellcenter where each.cell_withdata;
+			float Tairmix <- cell_Tairnomix;
+			float kernelsum_withdata <-0.0;
+			ask cellcenterssaround_airmixt5{
+				Tairmix <- Tairmix + (self.cell_Tairnomix*exp(-1.0*distance_to(myself,self)/(AirBlendDist_rnd)));
+				kernelsum_withdata <- kernelsum_withdata + exp(-1.0*distance_to(myself,self)/(AirBlendDist_rnd));
+			}
+			Tairmix<- Tairmix/(kernelsum_withdata+1.0);
+			cell_Tairmix <- Tairmix;
+			my_cell.Tairmix <- Tairmix;
+			my_cell.grid_value <- Tairmix;
+		}
+		
+		//compute accuracy
+		model_standardeviation <- sqrt(cell where (each.withdata and each.withactualTairmax) mean_of ((each.Tairmix-each.Tairactual)^2));
+		write "Model standard deviation: " + model_standardeviation;
+		
+		
+		//end simulation
+		write "duration of simulation: " + ((machine_time - startt)/1000)/60.0 + " minutes";
+		stop_currentrun <- true;
+		if !is_batch{
+			save cell to:"../results/Tairmix_"+suffix+".tif" format:"geotiff";
+			do pause;
+		}
+	}
+}
+
+species cellcenter{
+	cell my_cell;
+	bool cell_withdata;
+	bool cell_green_area;
+	float cell_area;
+	float cell_HM;
+	float cell_CC;
+	float cell_Tairnomix;
+	float cell_Tairmix;
+	
+}
+
+grid cell parallel: true files: [land_use_land_cover, evapotranspiration, actual_air_temperature]{
+	bool withdata;
+	bool withactualTairmax;
+	int lucode;
+	float ET0;	
+	float shade;
+	float Kc;
+	float albedo;
+	int green_area;
+	float buildingintensity;
+	float Tairactual;
+	
+	float CC;
+	float HM;
+	float area;
+	float GA;
+	float CCpark;
+	float Tairnomix;
+	float Tairmix;
+	
+	
+	rgb color_actual;
+	rgb color_modelled;
+	
+	aspect actual{
+		draw shape color: color_actual;
+	}
+	aspect modelled{
+		draw shape color: color_modelled;
+	}	
+}
+
+experiment Generate_Outputs type: gui {
+	output {
+		display map {
+			grid cell border: #black;
+		}
+	}
+}
+
+
+experiment mapcomparison type: gui {
+	output {
+		layout #split;
+		display actual type: opengl {
+			species cell aspect: actual;
+		}
+		display modeled type: opengl {
+			species cell aspect: modelled;
+		}
+	}
+}
+
+experiment Parameter_Exploration type: batch repeat: 1 keep_seed: true until: stop_currentrun{
+	parameter "Air Blending Distance:" var: AirBlendDist min: 300.0 max: 700.0 step: 100.0;
+	parameter "Maximum Cooling Distance:" var: MaxCoolDist min: 400.0 max: 800.0 step: 100.0;
+	parameter "Shade Weight:" var: shade_weight min: 0.20 max: 0.6 step: 0.1;
+	parameter "Albedo Weight:" var: albedo_weight min: 0.00 max: 0.40 step: 0.1;
+	parameter "Batch mode:" var: is_batch <- true;
+
+	permanent {
+		display Comparison {
+			chart "Model accuracy" type: series {
+				data "Model Accuracy" value: mean(simulations collect each.model_standardeviation) style: spline color: #blue ;
+			}
+		}	
+	}
+    
+    reflex save_results_explo{
+    	write "AirBlendDist:"+ AirBlendDist+". MaxCoolDist:"+MaxCoolDist;
+    	write "shade_weight:"+ shade_weight+". albedo_weight:"+albedo_weight+". evapotranspiration_weight:"+evapotranspiration_weight;
+		save [AirBlendDist, MaxCoolDist, shade_weight, albedo_weight, evapotranspiration_weight, model_standardeviation] 
+                   to: "../results/"+suffix+"/Exploration1.csv" format: "csv" rewrite: false header: true;	 
+	}
+}
